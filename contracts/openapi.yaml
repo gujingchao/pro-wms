@@ -1,0 +1,68 @@
+openapi: 3.0.3
+info:
+  title: pro-wms API
+  version: 0.1.0
+  description: Contract for CLI / web. selyla owns the real service.
+servers:
+  - url: http://127.0.0.1:8080
+paths:
+  /health:
+    get:
+      responses:
+        "200": { description: ok }
+  /snapshot:
+    get:
+      summary: Full kernel snapshot (warehouses, stock, docs) for admin UI
+      responses:
+        "200": { description: to_dict payload }
+  /ledger:
+    get:
+      parameters:
+        - { name: sku, in: query, required: true, schema: { type: string } }
+        - { name: warehouse, in: query, required: false, schema: { type: string } }
+      responses:
+        "200": { description: on_hand plus ledger rows }
+  /seed/demo:
+    post:
+      summary: Load multi-warehouse demo (batches, wave, pending stocktake)
+      responses:
+        "200": { description: seeded }
+  /inbounds/{id}/receive:
+    post:
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: receiving }
+        "409": { description: illegal transition }
+  /inbounds/{id}/putaway:
+    post:
+      responses:
+        "200": { description: putaway }
+  /outbounds/{id}/allocate:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              properties:
+                strategy: { type: string, enum: [fifo, fefo] }
+      responses:
+        "200": { description: allocated }
+        "409": { description: version conflict }
+  /waves:
+    post:
+      responses:
+        "200": { description: created }
+  /waves/{id}/pick:
+    post:
+      responses:
+        "200": { description: picked }
+        "409": { description: version conflict }
+  /stocktakes/{id}/approve:
+    post:
+      responses:
+        "200": { description: approved }
+  /race:
+    post:
+      summary: Reproduce concurrent allocation conflicts
+      responses:
+        "200": { description: one winner plus conflicts }

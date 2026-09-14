@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+*.py[cod]
+dist/
+build/
+.DS_Store
+node_modules/
+data/
+*.log
+.pro-wms-state.json
