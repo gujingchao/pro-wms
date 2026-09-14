@@ -10,11 +10,11 @@ from threading import RLock
 from typing import Literal
 
 from pro_wms_cli.allocation import (
+    InsufficientForPlan,
     LotView,
     StockView,
     get_strategy,
     plan_allocations,
-    InsufficientForPlan,
 )
 from pro_wms_cli.errors import (
     IllegalTransition,

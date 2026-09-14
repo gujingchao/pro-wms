@@ -109,13 +109,10 @@ def test_fifo_and_fefo_diverge_when_expiry_and_receipt_disagree():
 
 
 def test_fefo_respects_min_shelf_days():
-    from datetime import date, timedelta
-
-    from pro_wms_cli.kernel import Doc, Lot
+    from pro_wms_cli.kernel import Doc
 
     wh = Warehouse()
     wh.seed_demo()
-    today = date(2026, 9, 14)
     # Only near-expiry milk on hand for this outbound's threshold.
     wh.outbounds["OUT-SHELF"] = Doc(
         "OUT-SHELF",
