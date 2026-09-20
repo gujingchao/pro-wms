@@ -1,0 +1,13 @@
+# Normalise line endings repository-wide: store LF in the repository and check out
+# LF everywhere. This overrides the Windows system-level core.autocrlf=true so that
+# diffs stay identical across platforms and editors.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending translated.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
