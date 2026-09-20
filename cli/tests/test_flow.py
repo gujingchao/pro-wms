@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import json
+from datetime import date, timedelta
 
 import pytest
 
 from pro_wms_cli.cli import main
-from pro_wms_cli.errors import IllegalTransition, PermissionDenied, StockConflict
-from pro_wms_cli.kernel import Warehouse
+from pro_wms_cli.errors import (
+    IllegalTransition,
+    InsufficientStock,
+    InvalidRequest,
+    NotFound,
+    PermissionDenied,
+    StockConflict,
+)
+from pro_wms_cli.kernel import Doc, Lot, Warehouse
 from pro_wms_cli.store import kernel
 
 
@@ -86,7 +94,7 @@ def test_fifo_and_fefo_diverge_when_expiry_and_receipt_disagree():
 
     wh = Warehouse()
     wh.seed_demo()
-    today = date(2026, 9, 14)
+    today = date.today()
     # Fresh receipt but near expiry — FEFO wants this; FIFO prefers LOT-M1 (older receipt).
     wh.lots["LOT-M3"] = Lot(
         "LOT-M3",
@@ -130,3 +138,229 @@ def test_pluggable_strategy_registry():
 
     assert get_strategy("fifo").name == "fifo"
     assert get_strategy("fefo").name == "fefo"
+
+
+def test_expired_lots_are_never_allocated():
+    """A lot past its expiry must not be shipped even without min_shelf_days."""
+    wh = Warehouse()
+    wh.seed_demo()
+    wh.lots["LOT-M1"].expiry = date.today() - timedelta(days=1)
+    doc = wh.allocate_outbound("OUT-2001", strategy="fefo")
+    allocated = [a["lot"] for a in doc.meta["allocations"]]
+    assert "LOT-M1" not in allocated
+    assert allocated == ["LOT-M2"]
+
+
+def test_fefo_uses_real_today_not_a_frozen_date():
+    """Shelf-life maths must follow the clock, not a hardcoded calendar date."""
+    wh = Warehouse()
+    wh.seed_demo()
+    today = date.today()
+    # LOT-M1 is seeded at today+5; asking for a 7-day floor must always exclude it.
+    wh.outbounds["OUT-SHELF"] = Doc(
+        "OUT-SHELF",
+        "draft",
+        "WH-EAST",
+        [{"sku": "SKU-MILK", "qty": 2, "min_shelf_days": 7}],
+    )
+    doc = wh.allocate_outbound("OUT-SHELF", strategy="fefo", as_of=today)
+    assert doc.meta["allocations"][0]["lot"] == "LOT-M2"
+
+
+def test_wave_requires_at_least_one_outbound():
+    from pro_wms_cli.errors import InvalidRequest
+
+    wh = Warehouse()
+    wh.seed_demo()
+    with pytest.raises(InvalidRequest):
+        wh.wave_create([])
+
+
+def test_cli_http_mode_sends_identity(monkeypatch):
+    """`--as` must reach the service, otherwise RBAC is silently bypassed."""
+    import pro_wms_cli.cli as cli_mod
+    import pro_wms_cli.store as store_mod
+
+    monkeypatch.setenv("PRO_WMS_API", "http://127.0.0.1:9999")
+    store_mod.using_http.cache_clear()
+    sent: list[dict] = []
+
+    def fake_api_call(method, path, body=None, user=None):
+        sent.append({"method": method, "path": path, "user": user})
+        return {"stub": True}
+
+    monkeypatch.setattr(cli_mod, "api_call", fake_api_call)
+
+    assert cli_mod.main(["stocktake-approve", "ST-3001", "--as", "operator"]) == 0
+    assert sent[-1]["user"] == "operator"
+
+
+def test_cli_http_mode_forwards_ledger_warehouse(monkeypatch):
+    import pro_wms_cli.cli as cli_mod
+    import pro_wms_cli.store as store_mod
+
+    monkeypatch.setenv("PRO_WMS_API", "http://127.0.0.1:9999")
+    store_mod.using_http.cache_clear()
+    sent: list[dict] = []
+
+    def fake_api_call(method, path, body=None, user=None):
+        sent.append({"path": path})
+        return {"on_hand": 0, "ledger": []}
+
+    monkeypatch.setattr(cli_mod, "api_call", fake_api_call)
+
+    cli_mod.main(["ledger", "--sku", "SKU-MILK", "--warehouse", "WH-EAST"])
+    assert "warehouse=WH-EAST" in sent[-1]["path"]
+
+
+def test_putaway_with_unknown_location_keeps_document_open():
+    """A rejected putaway must not leave the document half-transitioned."""
+    wh = Warehouse()
+    wh.seed_demo()
+    wh.inbound_receive("IN-1001")
+    with pytest.raises(IllegalTransition):
+        wh.inbound_putaway("IN-1001", "NO-SUCH-LOC")
+    assert wh.inbounds["IN-1001"].status == "receiving"
+
+
+def test_putaway_is_all_or_nothing():
+    """One failing line must not move the stock of the lines before it."""
+    wh = Warehouse()
+    wh.seed_demo()
+    today = date.today()
+    wh.lots["LOT-M3"] = Lot("LOT-M3", "SKU-MILK", "B-M3", today + timedelta(days=9), today)
+    wh.inbounds["IN-MULTI"] = Doc(
+        "IN-MULTI",
+        "draft",
+        "WH-EAST",
+        [
+            {"sku": "SKU-MILK", "qty": 2, "lot": "LOT-M3", "from": "EAST-DOCK"},
+            {"sku": "SKU-MILK", "qty": 5, "lot": "LOT-M2", "from": "EAST-DOCK"},
+        ],
+    )
+    wh.inbound_receive("IN-MULTI")
+    # Sabotage the second line so putaway cannot cover it.
+    wh._consume("WH-EAST", "EAST-DOCK", "LOT-M2", 4, expected_version=None)
+    with pytest.raises(InsufficientStock):
+        wh.inbound_putaway("IN-MULTI", "EAST-A-01-01")
+    assert wh.inbounds["IN-MULTI"].status == "receiving"
+    assert wh.stock[("WH-EAST", "EAST-DOCK", "LOT-M3")].qty == 2
+    assert ("WH-EAST", "EAST-A-01-01", "LOT-M3") not in wh.stock
+
+
+def test_missing_ids_raise_not_found():
+    """A missing id is a domain `NotFound`, not a bare KeyError."""
+    wh = Warehouse()
+    wh.seed_demo()
+    with pytest.raises(NotFound):
+        wh.inbound_receive("IN-NOPE")
+    with pytest.raises(NotFound):
+        wh.allocate_outbound("OUT-NOPE")
+    with pytest.raises(NotFound):
+        wh.wave_create(["OUT-NOPE"])
+    with pytest.raises(NotFound):
+        wh.wave_pick("WV-NOPE")
+    with pytest.raises(NotFound):
+        wh.stocktake_approve("ST-NOPE", user="supervisor")
+
+
+def test_receive_with_unknown_lot_books_nothing():
+    wh = Warehouse()
+    wh.seed_demo()
+    wh.inbounds["IN-BAD"] = Doc("IN-BAD", "draft", "WH-EAST", [{"sku": "SKU-MILK", "qty": 1, "lot": "LOT-NOPE"}])
+    with pytest.raises(NotFound):
+        wh.inbound_receive("IN-BAD")
+    assert wh.inbounds["IN-BAD"].status == "draft"
+    assert wh.ledger == []
+
+
+def test_same_sku_twice_in_one_outbound_plans_once():
+    """Two lines of one SKU share a single plan instead of conflicting with each other."""
+    wh = Warehouse()
+    wh.seed_demo()
+    wh.outbounds["OUT-DUP"] = Doc(
+        "OUT-DUP",
+        "draft",
+        "WH-EAST",
+        [{"sku": "SKU-MILK", "qty": 2}, {"sku": "SKU-MILK", "qty": 3}],
+    )
+    doc = wh.allocate_outbound("OUT-DUP", strategy="fefo")
+    assert sum(a["qty"] for a in doc.meta["allocations"]) == 5
+    assert wh.qty_on_hand("SKU-MILK", "WH-EAST") == 5
+
+
+def test_allocation_conflict_changes_nothing():
+    """A version conflict must not leave stock deducted or the document advanced."""
+    wh = Warehouse()
+    wh.seed_demo()
+    before = wh.qty_on_hand("SKU-MILK", "WH-EAST")
+    row = wh.snapshot_candidates("WH-EAST", "SKU-MILK", "fefo")[0]
+
+    def poke() -> None:
+        wh._consume(row.warehouse, row.location, row.lot_id, 1, expected_version=row.version)
+
+    with pytest.raises(StockConflict):
+        wh.allocate_outbound("OUT-2001", strategy="fefo", before_commit=poke)
+    assert wh.outbounds["OUT-2001"].status == "draft"
+    assert wh.qty_on_hand("SKU-MILK", "WH-EAST") == before - 1  # only the poke landed
+    assert not [row for row in wh.ledger if row.ref_type == "allocate"]
+
+
+def test_wave_with_unallocated_sibling_moves_nothing():
+    """A bad member must not leave its siblings waved without a wave document."""
+    wh = Warehouse()
+    wh.seed_demo()
+    wh.outbounds["OUT-2002"] = Doc("OUT-2002", "draft", "WH-EAST", [{"sku": "SKU-MILK", "qty": 1}])
+    wh.allocate_outbound("OUT-2001")
+    with pytest.raises(IllegalTransition):
+        wh.wave_create(["OUT-2001", "OUT-2002"])
+    assert wh.outbounds["OUT-2001"].status == "allocated"
+    assert wh.waves == {}
+
+
+def test_wave_rejects_duplicate_ids():
+    wh = Warehouse()
+    wh.seed_demo()
+    wh.outbounds["OUT-2002"] = Doc("OUT-2002", "draft", "WH-EAST", [{"sku": "SKU-MILK", "qty": 1}])
+    wh.allocate_outbound("OUT-2001")
+    wh.allocate_outbound("OUT-2002")
+    with pytest.raises(InvalidRequest):
+        wh.wave_create(["OUT-2001", "OUT-2001"])
+    assert wh.outbounds["OUT-2001"].status == "allocated"
+
+
+def test_wave_rejects_cross_warehouse_batch():
+    wh = Warehouse()
+    wh.seed_demo()
+    wh.outbounds["OUT-WEST"] = Doc("OUT-WEST", "draft", "WH-WEST", [{"sku": "SKU-BOLT", "qty": 1}])
+    wh.allocate_outbound("OUT-2001")
+    wh.allocate_outbound("OUT-WEST")
+    with pytest.raises(InvalidRequest):
+        wh.wave_create(["OUT-2001", "OUT-WEST"])
+    assert wh.outbounds["OUT-2001"].status == "allocated"
+    assert wh.outbounds["OUT-WEST"].status == "allocated"
+    assert wh.waves == {}
+
+
+def test_race_rejects_out_of_range_args():
+    wh = Warehouse()
+    wh.seed_demo()
+    with pytest.raises(InvalidRequest):
+        wh.race_allocate("SKU-MILK", "WH-EAST", workers=1000)
+    with pytest.raises(InvalidRequest):
+        wh.race_allocate("SKU-MILK", "WH-EAST", workers=8, each_qty=0)
+
+
+def test_save_kernel_writes_atomically(tmp_path, monkeypatch):
+    """The snapshot must land via os.replace, leaving no temp file behind."""
+    import pro_wms_cli.store as store_mod
+
+    target = tmp_path / "state.json"
+    monkeypatch.setenv("PRO_WMS_STATE", str(target))
+    monkeypatch.delenv("PRO_WMS_EPHEMERAL", raising=False)
+
+    store_mod.save_kernel()
+
+    assert target.exists()
+    assert not (tmp_path / "state.json.tmp").exists()
+    assert "warehouses" in json.loads(target.read_text(encoding="utf-8"))

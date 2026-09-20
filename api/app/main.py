@@ -1,32 +1,45 @@
-"""FastAPI wrapper around the in-process Warehouse kernel."""
+"""FastAPI wrapper around the in-process `Warehouse` kernel.
+
+This layer is deliberately thin: it resolves the caller's identity, forwards to the
+kernel, and serializes the result. Business rules live in
+`pro_wms_cli.kernel` — do not re-implement them here.
+
+Identity: `X-User` header (preferred), `?as=` query, or a `user` field in the body,
+in that order. When none is supplied the request runs as `operator` (least
+privilege), so privileged actions must state their role explicitly.
+"""
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 from pro_wms_cli.errors import (
     IllegalTransition,
     InsufficientStock,
+    InvalidRequest,
+    NotFound,
     PermissionDenied,
     StockConflict,
 )
 from pro_wms_cli.kernel import Warehouse
+from pydantic import BaseModel, Field
 
 _WAREHOUSE = Warehouse()
 
 
 def get_warehouse() -> Warehouse:
+    """Return the process-global kernel."""
     return _WAREHOUSE
 
 
 def reset_warehouse() -> Warehouse:
-    """Replace process-global kernel (tests)."""
+    """Replace the process-global kernel with a fresh one (used by tests)."""
     global _WAREHOUSE
     _WAREHOUSE = Warehouse()
     return _WAREHOUSE
@@ -53,6 +66,11 @@ def _resolve_user(
     as_query: str | None = None,
     body_user: str | None = None,
 ) -> str:
+    """Resolve the acting identity: `X-User` header > `?as=` > body `user` > `default`.
+
+    `default` is always the least-privileged role that can still perform the common
+    case; endpoints requiring more must receive an explicit identity.
+    """
     if x_user and x_user.strip():
         return x_user.strip()
     if as_query and as_query.strip():
@@ -62,14 +80,42 @@ def _resolve_user(
     return default
 
 
+def allowed_origins() -> list[str]:
+    """Origins allowed by CORS, from `PRO_WMS_ALLOWED_ORIGINS` (comma separated).
+
+    Falls back to the local dev origins. A wildcard is never used because it cannot
+    be combined with credentialed requests and would expose the service to any site.
+    """
+    raw = os.environ.get("PRO_WMS_ALLOWED_ORIGINS", "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+    ]
+
+
 app = FastAPI(title="pro-wms API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=allowed_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-User"],
 )
+
+
+@app.exception_handler(InvalidRequest)
+async def _invalid_request(_request: Request, exc: InvalidRequest) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": str(exc), "error": "InvalidRequest"})
+
+
+# Single place where domain errors become HTTP statuses. Adding a domain error means
+# adding one handler here — never scattering status codes across endpoints.
+# `KeyError` is deliberately left unhandled: a stray dict-key bug inside the kernel
+# should surface as a 500, not be disguised as "resource not found".
 
 
 @app.exception_handler(IllegalTransition)
@@ -92,9 +138,9 @@ async def _insufficient_stock(_request: Request, exc: InsufficientStock) -> JSON
     return JSONResponse(status_code=409, content={"detail": str(exc), "error": "InsufficientStock"})
 
 
-@app.exception_handler(KeyError)
-async def _key_error(_request: Request, exc: KeyError) -> JSONResponse:
-    return JSONResponse(status_code=404, content={"detail": f"missing: {exc.args[0]}", "error": "NotFound"})
+@app.exception_handler(NotFound)
+async def _not_found(_request: Request, exc: NotFound) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": str(exc), "error": "NotFound"})
 
 
 class PutawayBody(BaseModel):
@@ -115,7 +161,9 @@ class WaveBody(BaseModel):
 class RaceBody(BaseModel):
     sku: str = "SKU-MILK"
     warehouse: str = "WH-EAST"
-    workers: int = 8
+    # Bounded: the harness spawns one thread per worker, so an unbounded value would
+    # let any caller exhaust the service.
+    workers: int = Field(8, ge=1, le=32)
     user: str | None = None
 
 
@@ -130,12 +178,13 @@ def health() -> dict[str, str]:
 
 @app.get("/snapshot")
 def snapshot() -> Any:
-    """Full kernel dump for admin UI / CLI `pro-wms snapshot`."""
+    """Full kernel dump for the admin UI and `pro-wms snapshot`."""
     return _jsonable(get_warehouse().to_dict())
 
 
 @app.post("/seed/demo")
 def seed_demo() -> Any:
+    """Reload the demo dataset. Destructive: discards current state."""
     return _jsonable(get_warehouse().seed_demo())
 
 
@@ -185,7 +234,7 @@ def wave_create(
     as_: str | None = Query(None, alias="as"),
     x_user: str | None = Header(None, alias="X-User"),
 ) -> Any:
-    user = _resolve_user(default="supervisor", x_user=x_user, as_query=as_, body_user=body.user)
+    user = _resolve_user(default="operator", x_user=x_user, as_query=as_, body_user=body.user)
     ids = [x.strip() for x in body.outbounds if x and x.strip()]
     return _jsonable(get_warehouse().wave_create(ids, user=user))
 
@@ -214,7 +263,7 @@ def stocktake_approve(
     body: UserBody | None = None,
 ) -> Any:
     user = _resolve_user(
-        default="supervisor",
+        default="operator",
         x_user=x_user,
         as_query=as_,
         body_user=body.user if body else None,
@@ -233,9 +282,10 @@ def race(body: RaceBody | None = None) -> Any:
 
 @app.get("/ledger")
 def ledger(
-    sku: str = Query(...),
-    warehouse: str | None = Query(None),
+    sku: str = Query(..., description="SKU to report on"),
+    warehouse: str | None = Query(None, description="Optional warehouse filter"),
 ) -> Any:
+    """Return `{"on_hand": int, "ledger": [...]}` for a SKU."""
     wh = get_warehouse()
     rows = [
         r.__dict__

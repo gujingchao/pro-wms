@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: pro-wms API
   version: 0.1.0
-  description: Contract for CLI / web. selyla owns the real service.
+  description: Contract shared by CLI and web; the service is the FastAPI app in api/.
 servers:
   - url: http://127.0.0.1:8080
 paths:

@@ -1,7 +1,9 @@
 """Pluggable stock allocation strategies (FIFO / FEFO).
 
-him owns this module: ranking rules, partial picks, and the optimistic
-version contract that _consume must honor. Redis is not the source of truth.
+This module is pure: it ranks candidates and plans allocations without touching any
+store. The caller (`kernel.Warehouse`) owns mutation and must commit each planned
+line with the `version_seen` recorded here — that version is the optimistic-lock
+token, not a cache key.
 """
 
 from __future__ import annotations
@@ -10,11 +12,27 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Literal, Protocol
 
+__all__ = [
+    "STRATEGIES",
+    "AllocationLine",
+    "AllocationStrategy",
+    "FefoStrategy",
+    "FifoStrategy",
+    "InsufficientForPlan",
+    "LotView",
+    "StockView",
+    "StrategyName",
+    "get_strategy",
+    "plan_allocations",
+]
+
 StrategyName = Literal["fifo", "fefo"]
 
 
 @dataclass(frozen=True)
 class LotView:
+    """Read-only projection of a lot used for ranking."""
+
     id: str
     sku: str
     batch_no: str
@@ -24,6 +42,8 @@ class LotView:
 
 @dataclass(frozen=True)
 class StockView:
+    """Read-only projection of a stock row used for ranking and version checks."""
+
     warehouse: str
     location: str
     lot_id: str
@@ -33,6 +53,8 @@ class StockView:
 
 @dataclass(frozen=True)
 class AllocationLine:
+    """One planned pick, plus the version it was planned against."""
+
     warehouse: str
     location: str
     lot_id: str
@@ -49,6 +71,8 @@ class AllocationStrategy(Protocol):
 
 
 class FifoStrategy:
+    """Oldest receipt first."""
+
     name: StrategyName = "fifo"
 
     def rank_key(self, stock: StockView, lot: LotView) -> tuple:
@@ -56,6 +80,8 @@ class FifoStrategy:
 
 
 class FefoStrategy:
+    """Soonest expiry first; undated lots sort last."""
+
     name: StrategyName = "fefo"
 
     def rank_key(self, stock: StockView, lot: LotView) -> tuple:
@@ -70,10 +96,27 @@ STRATEGIES: dict[StrategyName, AllocationStrategy] = {
 
 
 def get_strategy(name: StrategyName) -> AllocationStrategy:
+    """Look a strategy up by name.
+
+    Raises:
+        ValueError: unknown strategy name.
+    """
     try:
         return STRATEGIES[name]
     except KeyError as exc:
         raise ValueError(f"unknown allocation strategy: {name}") from exc
+
+
+class InsufficientForPlan(Exception):
+    """Raised when eligible stock cannot cover `need`.
+
+    Attributes:
+        short: How many units are still missing after planning.
+    """
+
+    def __init__(self, short: int) -> None:
+        self.short = short
+        super().__init__(f"short {short}")
 
 
 def plan_allocations(
@@ -85,7 +128,28 @@ def plan_allocations(
     as_of: date | None = None,
     min_remaining_shelf_days: int | None = None,
 ) -> list[AllocationLine]:
-    """Greedy partial allocate. Does not mutate stock; caller commits with version checks."""
+    """Plan how to cover `need` units from `candidates`. Pure — mutates nothing.
+
+    Args:
+        need: Requested quantity; zero or negative returns an empty plan.
+        candidates: Stock rows to consider. Must already be scoped to the target
+            warehouse and SKU by the caller.
+        lots: Lot lookup keyed by `lot_id`, used for expiry and receipt dates.
+        strategy: Ranking strategy name.
+        as_of: Reference date for expiry maths. Defaults to today.
+        min_remaining_shelf_days: Optional floor — lots with less remaining shelf
+            life are skipped, even if not yet expired.
+
+    Returns:
+        Allocation lines in ranked order, possibly splitting across several lots.
+        Each line carries the `version` observed on its source row.
+
+    Raises:
+        ValueError: unknown strategy.
+        InsufficientForPlan: eligible stock cannot cover `need` — note that lots
+            already past `expiry` are never eligible, regardless of
+            `min_remaining_shelf_days`.
+    """
     if need <= 0:
         return []
     strat = get_strategy(strategy)
@@ -95,6 +159,9 @@ def plan_allocations(
         if row.qty <= 0:
             continue
         lot = lots[row.lot_id]
+        # Never ship stock that has already passed its expiry date.
+        if lot.expiry is not None and lot.expiry < today:
+            continue
         if min_remaining_shelf_days is not None and lot.expiry is not None:
             if (lot.expiry - today).days < min_remaining_shelf_days:
                 continue
@@ -121,13 +188,7 @@ def plan_allocations(
     return plan
 
 
-class InsufficientForPlan(Exception):
-    def __init__(self, short: int) -> None:
-        self.short = short
-        super().__init__(f"short {short}")
-
-
-# Suggested Postgres commit (selyla migrations):
+# Reference SQL for a future Postgres-backed commit — mirrors _consume's semantics:
 #
 #   UPDATE stock
 #      SET qty = qty - :take, version = version + 1

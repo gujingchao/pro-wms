@@ -52,7 +52,7 @@ onUnmounted(() => {
         <div class="brand__mark">WMS</div>
         <div>
           <div class="brand__title">pro-wms</div>
-          <div class="brand__sub">wayly admin</div>
+          <div class="brand__sub">admin console</div>
         </div>
       </div>
       <nav class="nav">

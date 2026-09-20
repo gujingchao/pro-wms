@@ -1,4 +1,4 @@
-# pro-wms web（wayly）
+# pro-wms web
 
 Vue 3 + Vite + TypeScript 管理台，对接 FastAPI（默认 `http://127.0.0.1:8080`）。
 
@@ -6,7 +6,7 @@ Vue 3 + Vite + TypeScript 管理台，对接 FastAPI（默认 `http://127.0.0.1:
 
 | 路由 | 说明 |
 | --- | --- |
-| `/` | 仪表盘 / 一键 `POST /seed/demo`、可选 `getSnapshot()` |
+| `/` | 仪表盘 / 一键 `POST /seed/demo`、`GET /snapshot` 内核快照 |
 | `/inbound` | `IN-1001` receive → putaway |
 | `/outbound` | `OUT-2001` allocate（FIFO/FEFO） |
 | `/waves` | 创建波次、pick |
@@ -14,7 +14,9 @@ Vue 3 + Vite + TypeScript 管理台，对接 FastAPI（默认 `http://127.0.0.1:
 | `/ledger` | 按 sku/warehouse 查流水与 on_hand |
 | `/race` | 并发竞态演示 |
 
-壳层：侧栏导航、API Base URL、角色（`X-User`: operator / supervisor）、仓库切换（WH-EAST / WH-WEST）、连接健康检查。每次变更后右侧 JSON 面板 + 403/409 banner。
+壳层：侧栏导航、API Base URL、角色（`X-User`: operator / supervisor / admin）、
+仓库切换（WH-EAST / WH-WEST）、连接健康检查。
+每次变更后右侧 JSON 面板 + 403/409 banner。
 
 ## 开发
 
@@ -41,10 +43,12 @@ npm run build
 npm run preview
 ```
 
-## Snapshot TODO
+## Snapshot
 
-内核 `Warehouse.to_dict()` 已存在，但 API **尚无** `GET /snapshot`。客户端 `src/api/client.ts` 的 `getSnapshot()` 会尝试该端点，遇 404 时优雅回退到本地 demo 状态，并留有 TODO 注释。
+`GET /snapshot` 返回内核全量快照（`Warehouse.to_dict()` 的 JSON 化输出）。
+`src/api/client.ts` 的 `getSnapshot()` 在端点不可用（404）时优雅回退到本地 demo 状态。
 
 ## 契约
 
-对齐 `../contracts/openapi.yaml` 与 `../api/README.md`。勿改动 `api/` / `cli/` 行为。
+对齐 `../contracts/openapi.yaml` 与 `../api/README.md`。
+前端不承载业务规则，改动 `api/` / `cli/` 行为时请同步更新契约。

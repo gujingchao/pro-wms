@@ -1,4 +1,4 @@
--- Proposed physical model (selyla owns the real migrations).
+-- Proposed physical model; not yet wired into the code (the kernel is still in-memory).
 -- Optimistic stock.version is the concurrency token; Redis is not the source of truth.
 
 CREATE TABLE IF NOT EXISTS warehouses (
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS ledger (
 
 CREATE INDEX IF NOT EXISTS stock_sku_wh_idx ON stock (warehouse_id, lot_id);
 
--- Optimistic consume (him): version is the concurrency token.
+-- Optimistic consume: version is the concurrency token.
 -- UPDATE stock
 --    SET qty = qty - :take, version = version + 1
 --  WHERE warehouse_id = :wh AND location_id = :loc AND lot_id = :lot

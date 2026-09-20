@@ -1,15 +1,27 @@
-"""pro-wms CLI."""
+"""pro-wms CLI: state-machine driver and concurrency harness.
+
+Output contract: the result of a successful command is a JSON document printed to
+**stdout**. Diagnostics and errors go to **stderr** via `logging`, so piping stdout
+into `jq` always yields valid JSON.
+
+Exit codes: 0 success, 1 domain error or unknown document.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from collections.abc import Sequence
+from typing import Any
 
 from pro_wms_cli import __version__
 from pro_wms_cli.errors import WmsError
+from pro_wms_cli.logging_setup import configure, get_logger
 from pro_wms_cli.store import api_call, kernel, save_kernel, using_http
+
+__all__ = ["main"]
+
+_LOG = get_logger("cli")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -56,15 +68,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     led.add_argument("--warehouse", default=None)
 
     args = parser.parse_args(argv)
+    configure()
     try:
         print(_dispatch(args))
-    except (WmsError, KeyError, RuntimeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except (WmsError, RuntimeError) as exc:
+        _LOG.error("%s: %s", type(exc).__name__, exc)
         return 1
     return 0
 
 
-def _dump(value) -> str:
+def _dump(value: Any) -> str:
+    """Render a result as pretty JSON. `default=str` handles `date` values."""
     if hasattr(value, "__dataclass_fields__"):
         from dataclasses import asdict
 
@@ -73,6 +87,10 @@ def _dump(value) -> str:
 
 
 def _dispatch(args: argparse.Namespace) -> str:
+    """Run a command in-process and persist the snapshot afterwards.
+
+    `snapshot` and `ledger` are read-only and skip the save.
+    """
     if using_http():
         return _dispatch_http(args)
     wh = kernel()
@@ -122,6 +140,11 @@ def _dispatch(args: argparse.Namespace) -> str:
 
 
 def _dispatch_http(args: argparse.Namespace) -> str:
+    """Forward a command to the remote service.
+
+    Identity is sent as `X-User` rather than only in the body, so commands without a
+    body still reach the service with the caller's role intact.
+    """
     mapping = {
         "seed": ("POST", "/seed/demo", None),
         "snapshot": ("GET", "/snapshot", None),
@@ -144,10 +167,22 @@ def _dispatch_http(args: argparse.Namespace) -> str:
                 "workers": getattr(args, "workers", 8),
             },
         ),
-        "ledger": ("GET", f"/ledger?sku={getattr(args, 'sku', '')}", None),
+        "ledger": ("GET", _ledger_path(args), None),
     }
     method, path, body = mapping[args.cmd]
-    return _dump(api_call(method, path, body))
+    user = getattr(args, "user", None)
+    return _dump(api_call(method, path, body, user=user))
+
+
+def _ledger_path(args: argparse.Namespace) -> str:
+    """Build `/ledger?sku=...&warehouse=...`, omitting an unset warehouse."""
+    from urllib.parse import urlencode
+
+    params = {"sku": getattr(args, "sku", "") or ""}
+    warehouse = getattr(args, "warehouse", None)
+    if warehouse:
+        params["warehouse"] = warehouse
+    return f"/ledger?{urlencode(params)}"
 
 
 if __name__ == "__main__":
