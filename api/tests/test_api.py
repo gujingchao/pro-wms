@@ -121,3 +121,10 @@ def test_race_rejects_out_of_range_workers(client):
     payload = {"sku": "SKU-MILK", "warehouse": "WH-EAST"}
     assert client.post("/race", json={**payload, "workers": 1000}).status_code == 422
     assert client.post("/race", json={**payload, "workers": 0}).status_code == 422
+
+
+def test_unknown_strategy_is_422_not_silently_coerced(client):
+    """An unknown strategy must be rejected, not quietly replaced by fefo."""
+    client.post("/seed/demo")
+    r = client.post("/outbounds/OUT-2001/allocate", json={"strategy": "lifo"})
+    assert r.status_code == 422

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 __all__ = [
     "STRATEGIES",
@@ -65,7 +65,7 @@ class AllocationLine:
 class AllocationStrategy(Protocol):
     name: StrategyName
 
-    def rank_key(self, stock: StockView, lot: LotView) -> tuple:
+    def rank_key(self, stock: StockView, lot: LotView) -> tuple[Any, ...]:
         """Ascending sort key: earlier = preferred."""
         ...
 
@@ -75,7 +75,7 @@ class FifoStrategy:
 
     name: StrategyName = "fifo"
 
-    def rank_key(self, stock: StockView, lot: LotView) -> tuple:
+    def rank_key(self, stock: StockView, lot: LotView) -> tuple[Any, ...]:
         return (lot.received_at, lot.id, stock.location)
 
 
@@ -84,7 +84,7 @@ class FefoStrategy:
 
     name: StrategyName = "fefo"
 
-    def rank_key(self, stock: StockView, lot: LotView) -> tuple:
+    def rank_key(self, stock: StockView, lot: LotView) -> tuple[Any, ...]:
         # Missing expiry sorts last so undated industrial SKUs don't steal FEFO priority.
         return (lot.expiry or date.max, lot.received_at, lot.id, stock.location)
 

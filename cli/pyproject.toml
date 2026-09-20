@@ -4,20 +4,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pro-wms-cli"
-version = "0.1.0"
+# Single source of truth: the version lives in pro_wms_cli/__init__.py only.
+dynamic = ["version"]
 description = "pro-wms state-machine CLI and concurrency harness"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
 
 [project.scripts]
 pro-wms = "pro_wms_cli.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# PEP 561: the kernel ships inline types, so downstream (api/) can type-check it.
+[tool.setuptools.package-data]
+pro_wms_cli = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pro_wms_cli.__version__" }
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+strict_equality = true
+check_untyped_defs = true
+disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

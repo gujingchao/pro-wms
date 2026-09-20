@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, is_dataclass
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +29,8 @@ from pro_wms_cli.errors import (
 )
 from pro_wms_cli.kernel import Warehouse
 from pydantic import BaseModel, Field
+
+from app import __version__
 
 _WAREHOUSE = Warehouse()
 
@@ -97,7 +99,7 @@ def allowed_origins() -> list[str]:
     ]
 
 
-app = FastAPI(title="pro-wms API", version="0.1.0")
+app = FastAPI(title="pro-wms API", version=__version__)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins(),
@@ -149,7 +151,9 @@ class PutawayBody(BaseModel):
 
 
 class AllocateBody(BaseModel):
-    strategy: str = "fefo"
+    # A `Literal` rather than `str`: an unknown strategy is a 422 instead of being
+    # silently coerced to fefo, and the contract can verify the enum.
+    strategy: Literal["fifo", "fefo"] = "fefo"
     user: str | None = None
 
 
@@ -223,9 +227,8 @@ def outbound_allocate(
     x_user: str | None = Header(None, alias="X-User"),
 ) -> Any:
     payload = body or AllocateBody()
-    strategy = payload.strategy if payload.strategy in {"fifo", "fefo"} else "fefo"
     user = _resolve_user(default="operator", x_user=x_user, as_query=as_, body_user=payload.user)
-    return _jsonable(get_warehouse().allocate_outbound(outbound_id, strategy=strategy, user=user))
+    return _jsonable(get_warehouse().allocate_outbound(outbound_id, strategy=payload.strategy, user=user))
 
 
 @app.post("/waves")

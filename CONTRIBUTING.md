@@ -26,11 +26,11 @@ pip install -e ../cli && pip install -e ".[dev]"
 ## 提交前自检
 
 ```bash
-cd cli && ruff check . && pytest
-cd ../api && ruff check . && pytest -q
+cd cli && ruff check . && mypy && pytest
+cd ../api && ruff check . && mypy && pytest -q
 ```
 
-两项全部通过再提交。CI 会对 cli 与 api 分别跑 lint 与测试。
+三项全部通过再提交。CI 会对 cli 与 api 分别跑 lint、类型检查与测试。
 
 ## 代码规范
 
@@ -42,6 +42,8 @@ cd ../api && ruff check . && pytest -q
 - **日志**：用 `logging`（`pro_wms_cli.logging_setup`），日志走 stderr；CLI 的 JSON 结果走 stdout，这是对外契约。
 - **导出**：模块显式声明 `__all__`。
 - **格式**：行宽 120，ruff 规则 `E,F,I,UP`。
+- **类型**：公开函数全部标注，容器写完整（`dict[str, Any]` 而非 `dict`）。CI 跑 `mypy`；
+  cli 声明 `py.typed`（PEP 561），api 侧才能对内核做类型检查。
 
 ## 测试约定
 
@@ -49,6 +51,10 @@ cd ../api && ruff check . && pytest -q
   直接对 draft 建波会得到 `IllegalTransition`。
 - 涉及效期/日期的测试用 `date.today()` 或注入 `as_of`，不要硬编码日历日期。
 - 改动并发相关逻辑后，跑 `pro-wms race --workers 8` 确认冲突仍被正确挡住。
+- 提交路径（分配、波次、上架、收货）必须保持**全有或全无**：新增分支时先校验再变更，
+  失败不能留下部分扣减或半迁移的单据。
+- 改动接口后同步更新 `contracts/openapi.yaml`：`api/tests/test_contract.py` 会双向比对
+  路径、方法与版本，忘记更新会直接失败。
 
 ## 提交信息
 

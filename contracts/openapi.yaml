@@ -1,22 +1,29 @@
-openapi: 3.0.3
+# Must match what FastAPI generates (app.openapi()); test_contract.py fails on drift.
+openapi: 3.1.0
 info:
   title: pro-wms API
+  # Must equal app.__version__; api/tests/test_contract.py fails on drift.
   version: 0.1.0
-  description: Contract shared by CLI and web; the service is the FastAPI app in api/.
+  description: >-
+    Contract shared by the CLI and the web console; the service is the FastAPI app in api/.
+    This is a curated subset (paths, methods, identity), not a dump of the generated
+    schema. api/tests/test_contract.py keeps it from drifting from the running app.
 servers:
   - url: http://127.0.0.1:8080
 paths:
   /health:
     get:
+      summary: Liveness probe
       responses:
         "200": { description: ok }
   /snapshot:
     get:
-      summary: Full kernel snapshot (warehouses, stock, docs) for admin UI
+      summary: Full kernel snapshot (warehouses, stock, documents) for the admin console
       responses:
         "200": { description: to_dict payload }
   /ledger:
     get:
+      summary: Ledger rows plus on-hand quantity for one SKU
       parameters:
         - { name: sku, in: query, required: true, schema: { type: string } }
         - { name: warehouse, in: query, required: false, schema: { type: string } }
@@ -24,45 +31,120 @@ paths:
         "200": { description: on_hand plus ledger rows }
   /seed/demo:
     post:
-      summary: Load multi-warehouse demo (batches, wave, pending stocktake)
+      summary: Load the multi-warehouse demo dataset (destructive)
+      parameters:
+        - $ref: "#/components/parameters/UserHeader"
       responses:
         "200": { description: seeded }
-  /inbounds/{id}/receive:
+  /inbounds/{inbound_id}/receive:
     post:
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      summary: Book goods onto the dock (draft -> receiving)
+      parameters:
+        - { name: inbound_id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/UserHeader"
       responses:
         "200": { description: receiving }
+        "404": { description: unknown inbound or lot }
         "409": { description: illegal transition }
-  /inbounds/{id}/putaway:
+  /inbounds/{inbound_id}/putaway:
     post:
-      responses:
-        "200": { description: putaway }
-  /outbounds/{id}/allocate:
-    post:
+      summary: Move received goods to a storage bin (receiving -> closed)
+      parameters:
+        - { name: inbound_id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/UserHeader"
       requestBody:
+        required: true
         content:
           application/json:
             schema:
+              type: object
+              required: [to]
+              properties:
+                to: { type: string, description: target location id }
+      responses:
+        "200": { description: closed }
+        "409": { description: illegal transition or short stock }
+  /outbounds/{outbound_id}/allocate:
+    post:
+      summary: Reserve stock with FIFO / FEFO (draft -> allocated)
+      parameters:
+        - { name: outbound_id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/UserHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
               properties:
                 strategy: { type: string, enum: [fifo, fefo] }
       responses:
-        "200": { description: allocated }
-        "409": { description: version conflict }
+        "200": { description: "allocated; meta.allocations[] carries version_seen" }
+        "409": { description: version conflict or insufficient stock }
   /waves:
     post:
+      summary: Group allocated outbounds into a pick wave (supervisor only)
+      parameters:
+        - $ref: "#/components/parameters/UserHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outbounds]
+              properties:
+                outbounds:
+                  type: array
+                  items: { type: string }
       responses:
         "200": { description: created }
-  /waves/{id}/pick:
+        "400": { description: empty, duplicate or cross-warehouse outbound list }
+        "403": { description: supervisor identity required }
+  /waves/{wave_id}/pick:
     post:
+      summary: Complete a wave (waved -> shipped)
+      parameters:
+        - { name: wave_id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/UserHeader"
       responses:
-        "200": { description: picked }
-        "409": { description: version conflict }
-  /stocktakes/{id}/approve:
+        "200": { description: shipped }
+        "409": { description: wave is not pickable }
+  /stocktakes/{stocktake_id}/approve:
     post:
+      summary: Approve a submitted stocktake (supervisor only)
+      parameters:
+        - { name: stocktake_id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/UserHeader"
       responses:
         "200": { description: approved }
+        "403": { description: supervisor identity required }
   /race:
     post:
-      summary: Reproduce concurrent allocation conflicts
+      summary: Reproduce concurrent allocation conflicts (demo / debug endpoint)
+      parameters:
+        - $ref: "#/components/parameters/UserHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sku: { type: string }
+                warehouse: { type: string }
+                workers: { type: integer, minimum: 1, maximum: 32 }
       responses:
         "200": { description: one winner plus conflicts }
+        "422": { description: workers outside 1..32 }
+components:
+  parameters:
+    UserHeader:
+      name: X-User
+      in: header
+      required: false
+      description: >-
+        Acting identity (operator / supervisor / admin). Defaults to the least privileged
+        `operator`, so privileged endpoints return 403 unless an identity is declared.
+        `?as=` and a body `user` field are accepted as fallbacks.
+      schema: { type: string }

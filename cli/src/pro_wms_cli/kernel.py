@@ -17,6 +17,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from threading import Event, Lock, RLock
+from typing import Any, TypedDict
 
 from pro_wms_cli.allocation import (
     AllocationLine,
@@ -36,6 +37,18 @@ from pro_wms_cli.errors import (
     StockConflict,
 )
 from pro_wms_cli.logging_setup import get_logger
+
+__all__ = [
+    "MAX_RACE_WORKERS",
+    "RACE_WINDOW_SECONDS",
+    "Doc",
+    "LedgerRow",
+    "Lot",
+    "RaceResult",
+    "StockRow",
+    "Strategy",
+    "Warehouse",
+]
 
 #: Allocation strategy accepted by the kernel. Alias kept for brevity at call sites.
 Strategy = StrategyName
@@ -91,8 +104,8 @@ class Doc:
     id: str
     status: str
     warehouse: str
-    lines: list[dict]
-    meta: dict = field(default_factory=dict)
+    lines: list[dict[str, Any]]
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -109,6 +122,19 @@ class LedgerRow:
     ref_id: str
     qty_delta: int
     note: str = ""
+
+
+class RaceResult(TypedDict):
+    """Outcome of `race_allocate`, split by how each competing worker ended.
+
+    A healthy run has a non-empty `ok`, a non-empty `conflict` and an empty `other`;
+    `other` lists workers that failed for an unexpected reason.
+    """
+
+    ok: list[str]
+    conflict: list[str]
+    other: list[dict[str, str]]
+    on_hand: int
 
 
 class Warehouse:
@@ -145,7 +171,7 @@ class Warehouse:
         self._lock = RLock()
         self.warehouses: dict[str, str] = {}
         self.locations: dict[str, str] = {}
-        self.skus: dict[str, dict] = {}
+        self.skus: dict[str, dict[str, Any]] = {}
         self.lots: dict[str, Lot] = {}
         self.stock: dict[tuple[str, str, str], StockRow] = {}
         self.inbounds: dict[str, Doc] = {}
@@ -209,7 +235,7 @@ class Warehouse:
     def _write_ledger(self, sku: str, warehouse: str, ref_type: str, ref_id: str, qty: int, note: str = "") -> None:
         self.ledger.append(LedgerRow(sku, warehouse, ref_type, ref_id, qty, note))
 
-    def seed_demo(self) -> dict:
+    def seed_demo(self) -> dict[str, list[str]]:
         """Reset the kernel to the demo dataset.
 
         Returns:
@@ -632,7 +658,7 @@ class Warehouse:
                 total += row.qty
         return total
 
-    def race_allocate(self, sku: str, warehouse: str, workers: int = 8, each_qty: int = 3) -> dict:
+    def race_allocate(self, sku: str, warehouse: str, workers: int = 8, each_qty: int = 3) -> RaceResult:
         """Concurrency harness: fire `workers` allocations at the same stock.
 
         Args:
@@ -671,7 +697,9 @@ class Warehouse:
                 self.outbounds[oid] = Doc(oid, "draft", warehouse, [{"sku": sku, "qty": each_qty}])
                 created.append(oid)
 
-        results = {"ok": [], "conflict": [], "other": []}
+        ok: list[str] = []
+        conflict: list[str] = []
+        other: list[dict[str, str]] = []
         arrived = 0
         gate = Event()
         gate_lock = Lock()
@@ -703,15 +731,14 @@ class Warehouse:
             for fut in as_completed(futs):
                 oid, status = fut.result()
                 if status == "ok":
-                    results["ok"].append(oid)
+                    ok.append(oid)
                 elif status == "conflict":
-                    results["conflict"].append(oid)
+                    conflict.append(oid)
                 else:
-                    results["other"].append({"id": oid, "error": status})
-        results["on_hand"] = self.qty_on_hand(sku, warehouse)
-        return results
+                    other.append({"id": oid, "error": status})
+        return RaceResult(ok=ok, conflict=conflict, other=other, on_hand=self.qty_on_hand(sku, warehouse))
 
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize the whole kernel to a JSON-safe dict.
 
         Dates become ISO strings only after `json.dumps(..., default=str)`; this
@@ -741,20 +768,31 @@ class Warehouse:
             "wave_seq": self._wave_seq,
         }
 
-    def load_dict(self, data: dict[str, object]) -> None:
+    def load_dict(self, data: dict[str, Any]) -> None:
         """Restore state produced by `to_dict()`.
+
+        Args:
+            data: Snapshot as produced by `to_dict()`, usually after a JSON round
+                trip, so dates arrive as ISO strings.
 
         Side effects:
             Replaces all collections in place; not additive.
         """
-        from datetime import date as date_cls
 
-        def dparse(value):
+        def dparse(value: Any) -> date | None:
             if value is None:
                 return None
-            if isinstance(value, date_cls):
+            if isinstance(value, date):
                 return value
-            return date_cls.fromisoformat(value)
+            return date.fromisoformat(value)
+
+        def dparse_required(value: Any) -> date:
+            parsed = dparse(value)
+            if parsed is None:
+                # `received_at` drives FIFO ordering; a null here is a corrupt
+                # snapshot, which must fail loudly rather than poison the sort.
+                raise ValueError("snapshot has a null date where one is required")
+            return parsed
 
         self.warehouses = data.get("warehouses", {})
         self.locations = data.get("locations", {})
@@ -765,7 +803,7 @@ class Warehouse:
                 v["sku"],
                 v["batch_no"],
                 dparse(v.get("expiry")),
-                dparse(v["received_at"]),
+                dparse_required(v["received_at"]),
             )
             for k, v in data.get("lots", {}).items()
         }

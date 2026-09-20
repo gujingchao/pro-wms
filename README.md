@@ -118,8 +118,8 @@ CLI 与 API 已可用且测试覆盖完整（含并发竞态）。以下能力�
 欢迎 Issue 与 PR。提交前请确认：
 
 ```bash
-cd cli && ruff check . && pytest
-cd ../api && ruff check . && pytest -q
+cd cli && ruff check . && mypy && pytest
+cd ../api && ruff check . && mypy && pytest -q
 ```
 
 规范细节见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。

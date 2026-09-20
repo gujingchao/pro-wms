@@ -364,3 +364,27 @@ def test_save_kernel_writes_atomically(tmp_path, monkeypatch):
     assert target.exists()
     assert not (tmp_path / "state.json.tmp").exists()
     assert "warehouses" in json.loads(target.read_text(encoding="utf-8"))
+
+
+def test_snapshot_round_trip():
+    """`to_dict` -> JSON -> `load_dict` must restore an equivalent kernel."""
+    wh = Warehouse()
+    wh.seed_demo()
+    wh.inbound_receive("IN-1001")
+    wh.allocate_outbound("OUT-2001", strategy="fefo")
+
+    restored = Warehouse()
+    restored.load_dict(json.loads(json.dumps(wh.to_dict(), default=str)))
+
+    assert restored.to_dict() == wh.to_dict()
+    assert restored.qty_on_hand("SKU-MILK", "WH-EAST") == wh.qty_on_hand("SKU-MILK", "WH-EAST")
+
+
+def test_load_dict_rejects_null_received_at():
+    """A corrupt snapshot must fail loudly instead of poisoning FIFO ordering."""
+    wh = Warehouse()
+    wh.seed_demo()
+    payload = json.loads(json.dumps(wh.to_dict(), default=str))
+    payload["lots"]["LOT-M1"]["received_at"] = None
+    with pytest.raises(ValueError, match="null date"):
+        wh.load_dict(payload)

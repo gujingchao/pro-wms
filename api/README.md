@@ -77,7 +77,11 @@ pro-wms inbound-receive IN-1001
 ## 测试
 
 ```bash
-cd api && ruff check . && pytest -q
+cd api && ruff check . && mypy && pytest -q
 ```
 
 仅用内存内核，不依赖 Docker。
+
+`tests/test_contract.py` 会双向比对 `../contracts/openapi.yaml` 与 `app.openapi()`：
+路径与方法必须两边一致，OpenAPI 版本号与 `app.__version__` 必须相同，文档里的
+`strategy` 枚举必须等于内核的 `STRATEGIES`。接口增删却忘了改契约会直接失败。
