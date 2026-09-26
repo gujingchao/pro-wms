@@ -11,12 +11,16 @@ async function allocate() {
     api.outboundAllocate(session.baseUrl, outboundId.value.trim(), strategy.value, session.user),
   )
 }
+
+async function cancel() {
+  await runAction('取消出库', () => api.outboundCancel(session.baseUrl, outboundId.value.trim(), session.user))
+}
 </script>
 
 <template>
   <div class="page">
     <p class="lede">
-      出库分配使用 FIFO / FEFO；乐观版本冲突时返回 409 StockConflict。先 Seed 再分配 OUT-2001。
+      分配会预占库存，发运后才扣减实物。尚未加入波次的出库单可取消并释放预占。
     </p>
 
     <div class="card">
@@ -37,6 +41,7 @@ async function allocate() {
         <button type="button" class="btn btn--primary" :disabled="session.busy" @click="allocate">
           Allocate 分配
         </button>
+        <button type="button" class="btn" :disabled="session.busy" @click="cancel">取消出库</button>
       </div>
     </div>
   </div>

@@ -87,7 +87,7 @@ pro-wms race --workers 8                            # 并发压测：验证乐�
 ```bash
 # 1. 启动 API（先本地安装 cli，它未发布到 PyPI）
 cd api && pip install -e ../cli && pip install -e ".[dev]"
-uvicorn app.main:app --port 8080
+PRO_WMS_ENABLE_DEMO=1 uvicorn app.main:app --port 8080
 
 # 2. 启动管理台
 cd web && npm install && npm run dev    # http://localhost:5173
@@ -106,12 +106,21 @@ cd web && npm install && npm run dev    # http://localhost:5173
 
 ## 项目状态
 
-CLI 与 API 已可用且测试覆盖完整（含并发竞态）。以下能力在路线图中，欢迎认领：
+0.2 版区分实物库存、预占库存和可用库存；分配只预占，发运才扣减实物。
+API 提供内存回滚事务与 PostgreSQL 持久化，可用 `Idempotency-Key` 安全重试写请求。
 
-- [ ] Postgres 持久化（物理模型草案见 [`infra/init.sql`](infra/init.sql)），内核仍为进程内实现
-- [ ] Redis 热点锁与缓存
-- [ ] `api/Dockerfile` 与完整 Docker Compose 部署
-- [ ] 真实鉴权（当前 `X-User` 为客户端自证，仅适合演示与内网）
+- [x] PostgreSQL 分表持久化、版本化 SQL 迁移、事务与幂等记录
+- [x] 期初流水、取消预占、实际发运扣减
+- [x] Dockerfile 与 Compose 配置（需要可用的 Docker 引擎）
+- [ ] 真实鉴权（`X-User` 仍为演示身份）
+- [ ] 主数据/单据创建、盘点调账、完整业务操作界面
+
+**当前性能边界**：PostgreSQL 写事务串行，读取加载完整领域状态，适合作为小规模验证基线。
+不是高吞吐或高可用承诺。旧版 JSON 快照不自动转换，详见
+[库存模型、迁移和部署说明](docs/persistence.md)。
+
+API 演示入口默认关闭，需显式启用 `PRO_WMS_ENABLE_DEMO=1`。PowerShell 使用
+`$env:PRO_WMS_ENABLE_DEMO='1'` 后再运行 uvicorn。
 
 ## 参与贡献
 

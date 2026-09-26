@@ -91,6 +91,11 @@ class StockRow:
     lot_id: str
     qty: int
     version: int = 1
+    reserved: int = 0
+
+    @property
+    def available(self) -> int:
+        return self.qty - self.reserved
 
 
 @dataclass
@@ -324,6 +329,9 @@ class Warehouse:
                 )
             }
             self.ledger = []
+            for row in self.stock.values():
+                self._write_ledger(self.lots[row.lot_id].sku, row.warehouse,
+                                   "opening", row.lot_id, row.qty, "opening balance")
             self._wave_seq = 1
         return {"warehouses": list(self.warehouses), "inbounds": ["IN-1001"], "outbounds": ["OUT-2001"]}
 
@@ -391,7 +399,7 @@ class Warehouse:
                 required[key] = required.get(key, 0) + qty
             for key, qty in required.items():
                 row = self.stock.get(key)
-                have = 0 if row is None else row.qty
+                have = 0 if row is None else row.available
                 if row is None or have < qty:
                     raise InsufficientStock(f"{key} has {have}, need {qty}")
             for lot, src, qty, sku in receipts:
@@ -405,12 +413,12 @@ class Warehouse:
         return LotView(lot.id, lot.sku, lot.batch_no, lot.expiry, lot.received_at)
 
     def _stock_view(self, row: StockRow) -> StockView:
-        return StockView(row.warehouse, row.location, row.lot_id, row.qty, row.version)
+        return StockView(row.warehouse, row.location, row.lot_id, row.available, row.version)
 
     def _candidates(self, warehouse: str, sku: str, strategy: Strategy) -> list[StockRow]:
         rows = []
         for row in self.stock.values():
-            if row.warehouse != warehouse or row.qty <= 0:
+            if row.warehouse != warehouse or row.available <= 0:
                 continue
             lot = self.lots[row.lot_id]
             if lot.sku != sku:
@@ -444,8 +452,8 @@ class Warehouse:
         row = self.stock[key]
         if expected_version is not None and row.version != expected_version:
             raise StockConflict(f"{key} version {row.version} != {expected_version}")
-        if row.qty < qty:
-            raise InsufficientStock(f"{key} has {row.qty}, need {qty}")
+        if row.available < qty:
+            raise InsufficientStock(f"{key} has {row.available} available, need {qty}")
         row.qty -= qty
         row.version += 1
 
@@ -491,7 +499,7 @@ class Warehouse:
             records the `version_seen` it was planned against).
 
         Side effects:
-            Decrements stock per allocation line and appends a negative ledger entry.
+            Reserves stock per allocation line and appends a zero-delta audit entry.
             All or nothing: a rejected plan leaves stock and document status untouched.
             Not idempotent: a second call on the same document raises
             `IllegalTransition` because `allocated` permits no further allocation.
@@ -558,7 +566,7 @@ class Warehouse:
             return deepcopy(doc)
 
     def _commit_allocations(self, doc: Doc, plan_lines: list[AllocationLine], strategy: Strategy) -> None:
-        """Deduct every planned line or none at all. Caller must hold `self._lock`.
+        """Reserve every planned line or none at all. Caller must hold `self._lock`.
 
         Phase 1 replays the plan in memory — simulating cumulative deductions so two
         planned lines on the same row cannot double-spend — and raises before any
@@ -571,7 +579,7 @@ class Warehouse:
             row = self.stock.get(key)
             if row is None:
                 raise StockConflict(f"{key} disappeared since the snapshot")
-            qty, version = simulated.get(key, (row.qty, row.version))
+            qty, version = simulated.get(key, (row.available, row.version))
             if version != line.version_seen:
                 raise StockConflict(f"{key} version {version} != {line.version_seen}")
             if qty < line.qty:
@@ -579,10 +587,10 @@ class Warehouse:
             simulated[key] = (qty - line.qty, version + 1)
         for key, (qty, version) in simulated.items():
             row = self.stock[key]
-            row.qty = qty
+            row.reserved = row.qty - qty
             row.version = version
         for line in plan_lines:
-            self._write_ledger(self._lot(line.lot_id).sku, doc.warehouse, "allocate", doc.id, -line.qty, strategy)
+            self._write_ledger(self._lot(line.lot_id).sku, doc.warehouse, "allocate", doc.id, 0, strategy)
 
     def wave_create(self, outbound_ids: list[str], user: str = "supervisor") -> Doc:
         """Group allocated outbounds into a pick wave: `allocated -> waved`.
@@ -635,8 +643,8 @@ class Warehouse:
             A deep copy of the wave in status `shipped`.
 
         Side effects:
-            Sets the wave and all its outbounds to `shipped`. Stock was already
-            deducted at allocation time, so this writes no ledger rows.
+            Consumes the reservations, deducts physical stock and writes shipment
+            ledger rows. The existing pick endpoint still performs pick and ship together.
 
         Raises:
             IllegalTransition: the wave is not `waved`/`picking` (re-picking is
@@ -653,7 +661,25 @@ class Warehouse:
             # cannot leave the wave half-shipped.
             for doc in docs:
                 self._ensure_move(doc, self.OUTBOUND, "pick")
+            # Validate the entire shipment, including cumulative reservations, before writes.
+            shipments: dict[tuple[str, str, str], int] = {}
             for doc in docs:
+                for line in doc.meta["allocations"]:
+                    key = self._stock_key(doc.warehouse, line["location"], line["lot"])
+                    shipments[key] = shipments.get(key, 0) + line["qty"]
+            for key, qty in shipments.items():
+                row = self.stock.get(key)
+                if row is None or row.reserved < qty or row.qty < qty:
+                    raise StockConflict(f"reservation missing for {key}")
+            for key, qty in shipments.items():
+                row = self.stock[key]
+                row.qty -= qty
+                row.reserved -= qty
+                row.version += 1
+            for doc in docs:
+                for line in doc.meta["allocations"]:
+                    self._write_ledger(self._lot(line["lot"]).sku, doc.warehouse,
+                                       "ship", doc.id, -line["qty"])
                 self._move(doc, self.OUTBOUND, "pick", "picking")
                 self._move(doc, self.OUTBOUND, "ship", "shipped")
             wave.status = "shipped"
@@ -685,7 +711,7 @@ class Warehouse:
     def qty_on_hand(self, sku: str, warehouse: str | None = None) -> int:
         """Total physical quantity of `sku`, optionally scoped to one warehouse.
 
-        Includes stock reserved by allocation, because allocation deducts on commit.
+        Includes reserved goods until shipment; available stock excludes reservations.
         """
         total = 0
         for row in self.stock.values():
@@ -694,6 +720,37 @@ class Warehouse:
             if self.lots[row.lot_id].sku == sku:
                 total += row.qty
         return total
+
+    def qty_reserved(self, sku: str, warehouse: str | None = None) -> int:
+        with self._lock:
+            return sum(r.reserved for r in self.stock.values()
+                       if (warehouse is None or r.warehouse == warehouse) and self.lots[r.lot_id].sku == sku)
+
+    def qty_available(self, sku: str, warehouse: str | None = None) -> int:
+        with self._lock:
+            return self.qty_on_hand(sku, warehouse) - self.qty_reserved(sku, warehouse)
+
+    def outbound_cancel(self, outbound_id: str, user: str = "operator") -> Doc:
+        """Cancel a draft or allocated outbound and release its reservations atomically."""
+        self._require(user, "operator", "supervisor")
+        with self._lock:
+            doc = self._doc(self.outbounds, outbound_id)
+            if doc.status not in {"draft", "allocated"}:
+                raise IllegalTransition(f"{doc.id}: cannot cancel from {doc.status}")
+            releases: dict[tuple[str, str, str], int] = {}
+            for line in doc.meta.get("allocations", []):
+                key = self._stock_key(doc.warehouse, line["location"], line["lot"])
+                releases[key] = releases.get(key, 0) + line["qty"]
+            for key, qty in releases.items():
+                row = self.stock.get(key)
+                if row is None or row.reserved < qty:
+                    raise StockConflict(f"reservation missing for {key}")
+            for key, qty in releases.items():
+                self.stock[key].reserved -= qty
+                self.stock[key].version += 1
+                self._write_ledger(self._lot(key[2]).sku, doc.warehouse, "cancel", doc.id, 0)
+            doc.status = "cancelled"
+            return deepcopy(doc)
 
     def race_allocate(self, sku: str, warehouse: str, workers: int = 8, each_qty: int = 3) -> RaceResult:
         """Concurrency harness: fire `workers` allocations at the same stock.
@@ -782,6 +839,7 @@ class Warehouse:
         method itself returns native `date` objects inside `lots`.
         """
         return {
+            "schema_version": 2,
             "warehouses": self.warehouses,
             "locations": self.locations,
             "skus": self.skus,
@@ -793,6 +851,8 @@ class Warehouse:
                     "lot_id": r.lot_id,
                     "qty": r.qty,
                     "version": r.version,
+                    "reserved": r.reserved,
+                    "available": r.available,
                 }
                 for r in self.stock.values()
             ],
@@ -815,6 +875,9 @@ class Warehouse:
         Side effects:
             Replaces all collections in place; not additive.
         """
+
+        if data.get("schema_version") != 2:
+            raise InvalidRequest("legacy snapshot: inventory semantics changed; export and migrate explicitly")
 
         def dparse(value: Any) -> date | None:
             if value is None:
@@ -853,6 +916,7 @@ class Warehouse:
                 row["lot_id"],
                 row["qty"],
                 row["version"],
+                row["reserved"],
             )
         self.inbounds = {k: Doc(**v) for k, v in data.get("inbounds", {}).items()}
         self.outbounds = {k: Doc(**v) for k, v in data.get("outbounds", {}).items()}

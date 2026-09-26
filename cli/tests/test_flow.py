@@ -271,7 +271,7 @@ def test_receive_with_unknown_lot_books_nothing():
     with pytest.raises(NotFound):
         wh.inbound_receive("IN-BAD")
     assert wh.inbounds["IN-BAD"].status == "draft"
-    assert wh.ledger == []
+    assert all(row.ref_type == "opening" for row in wh.ledger)
 
 
 def test_same_sku_twice_in_one_outbound_plans_once():
@@ -286,7 +286,9 @@ def test_same_sku_twice_in_one_outbound_plans_once():
     )
     doc = wh.allocate_outbound("OUT-DUP", strategy="fefo")
     assert sum(a["qty"] for a in doc.meta["allocations"]) == 5
-    assert wh.qty_on_hand("SKU-MILK", "WH-EAST") == 5
+    assert wh.qty_on_hand("SKU-MILK", "WH-EAST") == 10
+    assert wh.qty_reserved("SKU-MILK", "WH-EAST") == 5
+    assert wh.qty_available("SKU-MILK", "WH-EAST") == 5
 
 
 def test_allocation_conflict_changes_nothing():

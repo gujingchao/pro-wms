@@ -53,12 +53,12 @@ async function seed() {
 async function trySnapshot() {
   snapshotNote.value = '请求 GET /snapshot…'
   const snap = await refreshSnapshot()
-  session.lastResult = snap
-  if (snap.source === 'local-demo') {
-    snapshotNote.value = 'GET /snapshot 不可用，已回退本地 demo。'
-  } else {
-    snapshotNote.value = `已加载 snapshot（仓 ${session.warehouseOptions.join(', ')}）。`
+  if (!snap) {
+    snapshotNote.value = '加载失败，当前没有可显示的库存数据。'
+    return
   }
+  session.lastResult = snap
+  snapshotNote.value = `已加载 snapshot（仓 ${session.warehouseOptions.join(', ')}）。`
 }
 </script>
 

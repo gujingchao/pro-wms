@@ -1,4 +1,6 @@
 -- Proposed physical model; not yet wired into the code (the kernel is still in-memory).
+-- HISTORICAL DRAFT ONLY. Version 0.2 uses api/app/migrations/001_inventory.sql
+-- in the pro_wms schema. Do not apply this file for a new installation.
 -- Optimistic stock.version is the concurrency token; Redis is not the source of truth.
 
 CREATE TABLE IF NOT EXISTS warehouses (

@@ -3,7 +3,7 @@ openapi: 3.1.0
 info:
   title: pro-wms API
   # Must equal app.__version__; api/tests/test_contract.py fails on drift.
-  version: 0.1.0
+  version: 0.2.0
   description: >-
     Contract shared by the CLI and the web console; the service is the FastAPI app in api/.
     This is a curated subset (paths, methods, identity), not a dump of the generated
@@ -11,6 +11,22 @@ info:
 servers:
   - url: http://127.0.0.1:8080
 paths:
+  /health/ready:
+    get:
+      summary: Storage and schema readiness
+      responses:
+        "200": { description: ready }
+        "503": { description: unavailable }
+  /outbounds/{outbound_id}/cancel:
+    post:
+      summary: Cancel draft or allocated outbound and release reservations
+      parameters:
+        - { name: outbound_id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/UserHeader"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200": { description: cancelled }
+        "409": { description: already waved, shipped or cancelled }
   /health:
     get:
       summary: Liveness probe
@@ -28,12 +44,13 @@ paths:
         - { name: sku, in: query, required: true, schema: { type: string } }
         - { name: warehouse, in: query, required: false, schema: { type: string } }
       responses:
-        "200": { description: on_hand plus ledger rows }
+        "200": { description: on_hand (physical), reserved, available plus ledger rows }
   /seed/demo:
     post:
-      summary: Load the multi-warehouse demo dataset (destructive)
+      summary: Explicit demo mode only; PostgreSQL initialization requires an empty database
       parameters:
         - $ref: "#/components/parameters/UserHeader"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200": { description: seeded }
   /inbounds/{inbound_id}/receive:
@@ -42,6 +59,7 @@ paths:
       parameters:
         - { name: inbound_id, in: path, required: true, schema: { type: string } }
         - $ref: "#/components/parameters/UserHeader"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200": { description: receiving }
         "404": { description: unknown inbound or lot }
@@ -52,6 +70,7 @@ paths:
       parameters:
         - { name: inbound_id, in: path, required: true, schema: { type: string } }
         - $ref: "#/components/parameters/UserHeader"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -70,6 +89,7 @@ paths:
       parameters:
         - { name: outbound_id, in: path, required: true, schema: { type: string } }
         - $ref: "#/components/parameters/UserHeader"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: false
         content:
@@ -86,6 +106,7 @@ paths:
       summary: Group allocated outbounds into a pick wave (supervisor only)
       parameters:
         - $ref: "#/components/parameters/UserHeader"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -107,6 +128,7 @@ paths:
       parameters:
         - { name: wave_id, in: path, required: true, schema: { type: string } }
         - $ref: "#/components/parameters/UserHeader"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200": { description: shipped }
         "409": { description: wave is not pickable }
@@ -116,6 +138,7 @@ paths:
       parameters:
         - { name: stocktake_id, in: path, required: true, schema: { type: string } }
         - $ref: "#/components/parameters/UserHeader"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200": { description: approved }
         "403": { description: supervisor identity required }
@@ -124,6 +147,7 @@ paths:
       summary: Reproduce concurrent allocation conflicts (demo / debug endpoint)
       parameters:
         - $ref: "#/components/parameters/UserHeader"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: false
         content:
@@ -139,6 +163,15 @@ paths:
         "422": { description: workers outside 1..32 }
 components:
   parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >-
+        Reuse for retries of the same operation, resolved actor and payload. A different
+        request with the same key returns 409. Only successful transactions are recorded.
+        Durable in PostgreSQL; process-local in memory mode. Not authentication.
+      schema: { type: string, minLength: 1, maxLength: 128 }
     UserHeader:
       name: X-User
       in: header

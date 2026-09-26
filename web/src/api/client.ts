@@ -14,6 +14,7 @@ export type RequestOptions = {
   method?: string
   body?: unknown
   user?: string | null
+  idempotencyKey?: string
   query?: Record<string, string | number | undefined | null>
 }
 
@@ -60,6 +61,7 @@ export async function apiRequest<T = unknown>(
   if (options.user) {
     headers['X-User'] = options.user
   }
+  if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey
 
   const res = await fetch(buildUrl(baseUrl, path, options.query), {
     method: options.method || (options.body !== undefined ? 'POST' : 'GET'),
@@ -104,45 +106,23 @@ export function isApiError(e: unknown): e is ApiError {
   )
 }
 
-/** Demo / local fallback when GET /snapshot is not available. */
-export const DEMO_SNAPSHOT = {
-  warehouses: { 'WH-EAST': 'East DC', 'WH-WEST': 'West DC' },
-  locations: {
-    'EAST-DOCK': 'WH-EAST',
-    'EAST-A-01-01': 'WH-EAST',
-    'EAST-A-01-02': 'WH-EAST',
-    'WEST-A-01-01': 'WH-WEST',
-  },
-  skus: {
-    'SKU-MILK': { name: 'Fresh milk', shelf_life_days: 14 },
-    'SKU-BOLT': { name: 'M8 bolt', shelf_life_days: null },
-  },
-  inbounds: { 'IN-1001': { id: 'IN-1001', status: 'draft', warehouse: 'WH-EAST' } },
-  outbounds: { 'OUT-2001': { id: 'OUT-2001', status: 'draft', warehouse: 'WH-EAST' } },
-  waves: {} as Record<string, unknown>,
-  stocktakes: { 'ST-3001': { id: 'ST-3001', status: 'submitted', warehouse: 'WH-EAST' } },
-  stock: [] as unknown[],
-  ledger: [] as unknown[],
-  source: 'local-demo' as 'local-demo' | 'api',
+export type Snapshot = {
+  warehouses: Record<string, string>
+  locations: Record<string, string>
+  skus: Record<string, unknown>
+  inbounds: Record<string, unknown>
+  outbounds: Record<string, unknown>
+  waves: Record<string, unknown>
+  stocktakes: Record<string, unknown>
+  stock: unknown[]
+  ledger: unknown[]
+  source: 'api'
 }
 
-/**
- * Live kernel snapshot via GET /snapshot (kernel.to_dict()).
- * Falls back to DEMO_SNAPSHOT on 404/network failure so the shell still renders.
- */
-export type Snapshot = typeof DEMO_SNAPSHOT & Record<string, unknown>
-
+/** Failed reads remain errors; never substitute demo stock for server data. */
 export async function getSnapshot(baseUrl: string): Promise<Snapshot> {
-  try {
-    const data = await apiRequest<Record<string, unknown>>(baseUrl, '/snapshot')
-    return { ...DEMO_SNAPSHOT, ...data, source: 'api' }
-  } catch (e) {
-    if (isApiError(e) && (e.status === 404 || e.status === 405)) {
-      return { ...DEMO_SNAPSHOT, source: 'local-demo' }
-    }
-    // Network / other: still fall back so shell can render
-    return { ...DEMO_SNAPSHOT, source: 'local-demo' }
-  }
+  const data = await apiRequest<Record<string, unknown>>(baseUrl, '/snapshot')
+  return { ...data, source: 'api' } as Snapshot
 }
 
 export const api = {
@@ -166,6 +146,8 @@ export const api = {
       body: { strategy },
       user,
     }),
+  outboundCancel: (base: string, id: string, user?: string | null) =>
+    apiRequest(base, `/outbounds/${encodeURIComponent(id)}/cancel`, { method: 'POST', user }),
   waveCreate: (base: string, outbounds: string[], user?: string | null) =>
     apiRequest(base, '/waves', { method: 'POST', body: { outbounds }, user }),
   wavePick: (base: string, id: string, user?: string | null) =>
@@ -178,7 +160,7 @@ export const api = {
     user?: string | null,
   ) => apiRequest(base, '/race', { method: 'POST', body, user }),
   ledger: (base: string, sku: string, warehouse?: string | null) =>
-    apiRequest<{ on_hand: number; ledger: unknown[] }>(base, '/ledger', {
+    apiRequest<{ on_hand: number; reserved: number; available: number; ledger: unknown[] }>(base, '/ledger', {
       method: 'GET',
       query: { sku, warehouse: warehouse || undefined },
     }),

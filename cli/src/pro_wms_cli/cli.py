@@ -27,6 +27,7 @@ _LOG = get_logger("cli")
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pro-wms", description="pro-wms state machine + race harness")
     parser.add_argument("--version", action="version", version=f"pro-wms {__version__}")
+    parser.add_argument("--idempotency-key", help="reuse this key when retrying the same HTTP write")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("seed", help="load multi-warehouse demo")
@@ -44,6 +45,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     alloc.add_argument("id")
     alloc.add_argument("--strategy", choices=["fifo", "fefo"], default="fefo")
     alloc.add_argument("--as", dest="user", default="operator")
+
+    cancel = sub.add_parser("outbound-cancel")
+    cancel.add_argument("id")
+    cancel.add_argument("--as", dest="user", default="operator")
 
     wave = sub.add_parser("wave-create")
     wave.add_argument("--outbounds", required=True, help="comma-separated outbound ids")
@@ -93,6 +98,8 @@ def _dispatch(args: argparse.Namespace) -> str:
     """
     if using_http():
         return _dispatch_http(args)
+    if args.idempotency_key is not None:
+        raise RuntimeError("--idempotency-key requires PRO_WMS_API (transactional service mode)")
     wh = kernel()
     if args.cmd == "seed":
         out = _dump(wh.seed_demo())
@@ -108,6 +115,10 @@ def _dispatch(args: argparse.Namespace) -> str:
         return out
     if args.cmd == "outbound-allocate":
         out = _dump(wh.allocate_outbound(args.id, strategy=args.strategy, user=args.user))
+        save_kernel()
+        return out
+    if args.cmd == "outbound-cancel":
+        out = _dump(wh.outbound_cancel(args.id, user=args.user))
         save_kernel()
         return out
     if args.cmd == "wave-create":
@@ -136,7 +147,9 @@ def _dispatch(args: argparse.Namespace) -> str:
         for r in wh.ledger
         if r.sku == args.sku and (args.warehouse is None or r.warehouse == args.warehouse)
     ]
-    return _dump({"on_hand": wh.qty_on_hand(args.sku, args.warehouse), "ledger": rows})
+    return _dump({"on_hand": wh.qty_on_hand(args.sku, args.warehouse),
+                  "reserved": wh.qty_reserved(args.sku, args.warehouse),
+                  "available": wh.qty_available(args.sku, args.warehouse), "ledger": rows})
 
 
 def _dispatch_http(args: argparse.Namespace) -> str:
@@ -146,6 +159,7 @@ def _dispatch_http(args: argparse.Namespace) -> str:
     body still reach the service with the caller's role intact.
     """
     mapping = {
+        "outbound-cancel": ("POST", f"/outbounds/{getattr(args, 'id', '')}/cancel", None),
         "seed": ("POST", "/seed/demo", None),
         "snapshot": ("GET", "/snapshot", None),
         "inbound-receive": ("POST", f"/inbounds/{getattr(args, 'id', '')}/receive", None),
@@ -171,6 +185,8 @@ def _dispatch_http(args: argparse.Namespace) -> str:
     }
     method, path, body = mapping[args.cmd]
     user = getattr(args, "user", None)
+    if args.idempotency_key is not None:
+        return _dump(api_call(method, path, body, user=user, idempotency_key=args.idempotency_key))
     return _dump(api_call(method, path, body, user=user))
 
 

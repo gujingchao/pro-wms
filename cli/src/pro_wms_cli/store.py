@@ -64,10 +64,10 @@ def kernel() -> Warehouse:
     if not _LOADED:
         with _LOAD_LOCK:
             if not _LOADED:
-                _LOADED = True
                 path = state_path()
                 if not ephemeral() and path.exists():
                     _KERNEL.load_dict(json.loads(path.read_text(encoding="utf-8")))
+                _LOADED = True
     return _KERNEL
 
 
@@ -94,7 +94,8 @@ def api_base() -> str | None:
     return raw.rstrip("/") or None
 
 
-def api_call(method: str, path: str, body: dict[str, Any] | None = None, user: str | None = None) -> dict[str, Any]:
+def api_call(method: str, path: str, body: dict[str, Any] | None = None, user: str | None = None,
+             idempotency_key: str | None = None) -> dict[str, Any]:
     """Perform one HTTP request against the service.
 
     Args:
@@ -116,6 +117,8 @@ def api_call(method: str, path: str, body: dict[str, Any] | None = None, user: s
         # Identity must travel on every call, otherwise the service falls back to its
         # own default user and RBAC is silently bypassed.
         req.add_header("X-User", user)
+    if idempotency_key is not None:
+        req.add_header("Idempotency-Key", idempotency_key)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read().decode()

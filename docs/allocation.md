@@ -25,14 +25,14 @@
 2. 纯函数规划（不改库存）
 3. 提交前在内存中按顺序预演整份计划（逐行校验 `version` 与可用量），全部通过才落库
 4. 预演不通过 → `StockConflict` / `InsufficientStock`，**库存与单据状态均不变**（全有或全无）
-5. Postgres 落地用 `UPDATE ... WHERE version = :seen AND qty >= :take`（见 `infra/init.sql`）
-6. Redis 只做热点锁/缓存，不是库存真相
+5. 分配增加 reserved，实物 qty 不变；可用量为 qty - reserved
+6. PostgreSQL 事务串行化提交并校验行版本；取消释放预占，发运扣减实物（见 `persistence.md`）
 
 失败语义：冲突是**预期结果**而非缺陷——调用方应重试（重新快照 → 重新规划）。
-`allocate_outbound` 不幂等，同一单据重复分配会因状态机报 `IllegalTransition`。
+内核同一单据重复分配仍报 `IllegalTransition`；API 同一 `Idempotency-Key` 重试返回原成功结果。
 
 ## 对齐
 
 - CLI：`pro-wms race` / pytest `test_race_has_conflicts`、`test_fifo_and_fefo_diverge_*`
-- API：`POST /outbounds/{id}/allocate?strategy=fefo|fifo` 返回 `meta.allocations[].version_seen`
+- API：`POST /outbounds/{id}/allocate（JSON body 的 strategy 为 fefo/fifo）` 返回 `meta.allocations[].version_seen`
 - 管理台：拣货页展示策略与冲突提示

@@ -3,46 +3,37 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: wms
-      POSTGRES_PASSWORD: wms
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env and choose a password}
       POSTGRES_DB: pro_wms
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./infra/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wms -d pro_wms"]
       interval: 5s
       timeout: 3s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    command: redis-server --appendonly yes
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   api:
     profiles: ["full"]
-    build: ./api
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     environment:
-      DATABASE_URL: postgresql+psycopg://wms:wms@postgres:5432/pro_wms
-      REDIS_URL: redis://redis:6379/0
+      PRO_WMS_REPOSITORY: postgres
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: wms
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      PGDATABASE: pro_wms
+      DATABASE_URL: "dbname=pro_wms"
+      PRO_WMS_ENABLE_DEMO: ${PRO_WMS_ENABLE_DEMO:-0}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
 
 volumes:
   postgres_data:
-  redis_data:

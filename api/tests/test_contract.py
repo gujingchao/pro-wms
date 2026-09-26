@@ -103,3 +103,13 @@ def test_identity_header_is_documented_on_every_post(contract: dict[str, Any]) -
                 continue
             refs = {parameter.get("$ref") for parameter in operation.get("parameters", [])}
             assert USER_HEADER_REF in refs, f"{method.upper()} {path} does not document X-User"
+
+
+def test_idempotency_header_is_present_on_every_post(contract: dict[str, Any], schema: dict[str, Any]) -> None:
+    for path, item in contract["paths"].items():
+        if "post" not in item:
+            continue
+        refs = {p.get("$ref") for p in item["post"].get("parameters", [])}
+        assert "#/components/parameters/IdempotencyKey" in refs
+        headers = {p["name"] for p in schema["paths"][path]["post"].get("parameters", []) if p["in"] == "header"}
+        assert "Idempotency-Key" in headers

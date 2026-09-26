@@ -48,8 +48,15 @@ export async function checkHealth() {
 }
 
 /** Pull GET /snapshot and refresh warehouse switcher + cached snapshot. */
-export async function refreshSnapshot(): Promise<Snapshot> {
-  const snap = await getSnapshot(session.baseUrl)
+export async function refreshSnapshot(): Promise<Snapshot | null> {
+  let snap: Snapshot
+  try {
+    snap = await getSnapshot(session.baseUrl)
+  } catch {
+    session.snapshot = null
+    showBanner('warn', '库存数据加载失败，请检查连接后重试。')
+    return null
+  }
   session.snapshot = snap
   const wh = snap.warehouses
   if (wh && typeof wh === 'object') {

@@ -1,6 +1,6 @@
 # pro-wms API
 
-FastAPI 服务，包装进程内的 `pro_wms_cli.kernel.Warehouse`（行为与 CLI 完全一致）。
+FastAPI 服务，通过事务仓储执行 `pro_wms_cli.kernel.Warehouse`（行为与 CLI 完全一致）。
 
 端口 **8080**。这一层刻意做薄：只负责解析身份、转发内核、序列化结果，
 **业务规则一律在内核**，不要在此重写。
@@ -18,7 +18,7 @@ pip install -e ".[dev]"
 
 ```bash
 cd api
-uvicorn app.main:app --host 0.0.0.0 --port 8080
+PRO_WMS_ENABLE_DEMO=1 uvicorn app.main:app --host 127.0.0.1 --port 8080
 ```
 
 让 CLI 指向它：
@@ -28,6 +28,10 @@ export PRO_WMS_API=http://127.0.0.1:8080
 pro-wms seed
 pro-wms inbound-receive IN-1001
 ```
+
+PostgreSQL 启动、幂等 key、数量兼容说明见 [持久化文档](../docs/persistence.md)。
+新增 `GET /health/ready` 检查存储，`POST /outbounds/{id}/cancel` 取消尚未入波次的出库单。
+所有写接口支持 `Idempotency-Key`；同 key 不同操作、有效身份或参数返回 409。
 
 ## 身份
 
@@ -43,7 +47,7 @@ pro-wms inbound-receive IN-1001
 | --- | --- | --- |
 | GET | `/health` | `{status: ok}` |
 | GET | `/snapshot` | 内核全量快照（`to_dict()` 输出） |
-| POST | `/seed/demo` | 装入演示数据（**会清空现有状态**） |
+| POST | `/seed/demo` | 显式演示模式；内存重置，PostgreSQL 仅空库初始化 |
 | POST | `/inbounds/{id}/receive` | 可选 `X-User` / `?as=` / body `user`（默认 operator） |
 | POST | `/inbounds/{id}/putaway` | body `{to}`，默认 operator |
 | POST | `/outbounds/{id}/allocate` | body `{strategy: fifo\|fefo}`，默认 operator |
@@ -51,7 +55,7 @@ pro-wms inbound-receive IN-1001
 | POST | `/waves/{id}/pick` | 默认 operator |
 | POST | `/stocktakes/{id}/approve` | **需 supervisor** |
 | POST | `/race` | body `{sku, warehouse, workers}` |
-| GET | `/ledger?sku=&warehouse=` | `on_hand` + 流水行 |
+| GET | `/ledger?sku=&warehouse=` | `on_hand` / `reserved` / `available` + 流水行 |
 
 ## 错误
 
@@ -80,7 +84,7 @@ pro-wms inbound-receive IN-1001
 cd api && ruff check . && mypy && pytest -q
 ```
 
-仅用内存内核，不依赖 Docker。
+默认使用内存；设置 `PRO_WMS_TEST_DSN` 后运行真实 PostgreSQL 用例，测试账号需具备创建测试库权限。
 
 `tests/test_contract.py` 会双向比对 `../contracts/openapi.yaml` 与 `app.openapi()`：
 路径与方法必须两边一致，OpenAPI 版本号与 `app.__version__` 必须相同，文档里的
