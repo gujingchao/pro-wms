@@ -7,6 +7,16 @@ def test_health(client):
     assert r.json() == {"status": "ok"}
 
 
+def test_cross_warehouse_putaway_returns_400_without_changes(client):
+    assert client.post("/seed/demo").status_code == 200
+    assert client.post("/inbounds/IN-1001/receive").status_code == 200
+    before = client.get("/snapshot").json()
+    response = client.post("/inbounds/IN-1001/putaway", json={"to": "WEST-A-01-01"})
+    assert response.status_code == 400
+    assert response.json()["error"] == "InvalidRequest"
+    assert client.get("/snapshot").json() == before
+
+
 def test_closed_loop(client):
     r = client.post("/seed/demo")
     assert r.status_code == 200

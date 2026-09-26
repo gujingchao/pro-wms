@@ -223,6 +223,38 @@ class Warehouse:
     def _stock_key(self, warehouse: str, location: str, lot_id: str) -> tuple[str, str, str]:
         return (warehouse, location, lot_id)
 
+    @staticmethod
+    def _positive_quantity(value: Any) -> int:
+        if type(value) is not int or value <= 0:
+            raise InvalidRequest("quantity must be a positive integer")
+        return value
+
+    def _validate_location(self, warehouse: str, location: str) -> None:
+        if warehouse not in self.warehouses:
+            raise InvalidRequest(f"unknown warehouse {warehouse}")
+        if location not in self.locations:
+            raise IllegalTransition(f"unknown location {location}")
+        if self.locations[location] != warehouse:
+            raise InvalidRequest(f"location {location} does not belong to {warehouse}")
+
+    def _receipt_lines(self, doc: Doc) -> list[tuple[Lot, str, int, str]]:
+        """Validate all inbound lines before any stock or status mutation."""
+        if not doc.lines:
+            raise InvalidRequest("inbound requires at least one line")
+        receipts: list[tuple[Lot, str, int, str]] = []
+        for line in doc.lines:
+            if not {"sku", "lot", "qty"} <= line.keys():
+                raise InvalidRequest("inbound line requires sku, lot and qty")
+            lot = self._lot(line["lot"])
+            sku = line["sku"]
+            if sku not in self.skus or lot.sku != sku:
+                raise InvalidRequest(f"SKU {sku} does not match lot {lot.id}")
+            qty = self._positive_quantity(line["qty"])
+            src = line.get("from", "EAST-DOCK")
+            self._validate_location(doc.warehouse, src)
+            receipts.append((lot, src, qty, sku))
+        return receipts
+
     def _add_stock(self, warehouse: str, location: str, lot_id: str, qty: int) -> None:
         key = self._stock_key(warehouse, location, lot_id)
         row = self.stock.get(key)
@@ -311,6 +343,7 @@ class Warehouse:
 
         Raises:
             PermissionDenied: caller lacks the required role.
+            InvalidRequest: empty lines, invalid quantities or mismatched SKU/location.
             IllegalTransition: document is not in `draft`.
             NotFound: the inbound id or one of its lot ids does not exist.
         """
@@ -320,10 +353,7 @@ class Warehouse:
             # Validate every line before mutating: a missing lot must not leave the
             # document half-received with stock already booked onto some lines.
             self._ensure_move(doc, self.INBOUND, "receive")
-            receipts: list[tuple[Lot, str, int, str]] = [
-                (self._lot(line["lot"]), line.get("from", "EAST-DOCK"), int(line["qty"]), line["sku"])
-                for line in doc.lines
-            ]
+            receipts = self._receipt_lines(doc)
             doc.status = "receiving"
             for lot, src, qty, sku in receipts:
                 self._add_stock(doc.warehouse, src, lot.id, qty)
@@ -334,7 +364,7 @@ class Warehouse:
         """Move received goods from the dock to a storage bin: `receiving -> closed`.
 
         Args:
-            to_location: Target location id; must already exist in `self.locations`.
+            to_location: Existing target location in the document's warehouse.
 
         Side effects:
             Consumes stock at the source and re-adds it at the target. Net on-hand is
@@ -343,6 +373,7 @@ class Warehouse:
 
         Raises:
             IllegalTransition: document not in `receiving`, or unknown location.
+            InvalidRequest: invalid line data or a location in another warehouse.
             InsufficientStock: the source row does not hold enough stock to move.
             NotFound: the inbound id does not exist.
         """
@@ -352,22 +383,22 @@ class Warehouse:
             # Validate the whole move before touching state: a rejected putaway must
             # never leave the document half-transitioned.
             self._ensure_move(doc, self.INBOUND, "putaway")
-            if to_location not in self.locations:
-                raise IllegalTransition(f"unknown location {to_location}")
-            moves: list[tuple[str, str, int, str]] = []
-            for line in doc.lines:
-                src = line.get("from", "EAST-DOCK")
-                qty = int(line["qty"])
-                row = self.stock.get(self._stock_key(doc.warehouse, src, line["lot"]))
+            self._validate_location(doc.warehouse, to_location)
+            receipts = self._receipt_lines(doc)
+            required: dict[tuple[str, str, str], int] = {}
+            for lot, src, qty, _sku in receipts:
+                key = self._stock_key(doc.warehouse, src, lot.id)
+                required[key] = required.get(key, 0) + qty
+            for key, qty in required.items():
+                row = self.stock.get(key)
                 have = 0 if row is None else row.qty
                 if row is None or have < qty:
-                    raise InsufficientStock(f"{src}/{line['lot']} has {have}, need {qty}")
-                moves.append((src, line["lot"], qty, line["sku"]))
-            doc.status = "closed"
-            for src, lot_id, qty, sku in moves:
-                self._consume(doc.warehouse, src, lot_id, qty, expected_version=None)
-                self._add_stock(doc.warehouse, to_location, lot_id, qty)
+                    raise InsufficientStock(f"{key} has {have}, need {qty}")
+            for lot, src, qty, sku in receipts:
+                self._consume(doc.warehouse, src, lot.id, qty, expected_version=None)
+                self._add_stock(doc.warehouse, to_location, lot.id, qty)
                 self._write_ledger(sku, doc.warehouse, "inbound-putaway", doc.id, 0, f"{src}->{to_location}")
+            doc.status = "closed"
             return deepcopy(doc)
 
     def _lot_view(self, lot: Lot) -> LotView:
@@ -478,11 +509,17 @@ class Warehouse:
             raise IllegalTransition(f"{doc.id}: cannot allocate from {doc.status}")
         need_by_sku: dict[str, int] = {}
         shelf_by_sku: dict[str, int] = {}
+        if not doc.lines or doc.warehouse not in self.warehouses:
+            raise InvalidRequest("outbound requires a known warehouse and at least one line")
         for line in doc.lines:
+            if not {"sku", "qty"} <= line.keys() or line["sku"] not in self.skus:
+                raise InvalidRequest("outbound line requires a known sku and qty")
             sku = line["sku"]
-            need_by_sku[sku] = need_by_sku.get(sku, 0) + int(line["qty"])
+            need_by_sku[sku] = need_by_sku.get(sku, 0) + self._positive_quantity(line["qty"])
             floor = line.get("min_shelf_days")
             if floor is not None:
+                if type(floor) is not int or floor < 0:
+                    raise InvalidRequest("min_shelf_days must be a non-negative integer")
                 # Conflicting floors for one SKU: honour the strictest line.
                 shelf_by_sku[sku] = max(floor, shelf_by_sku.get(sku, floor))
         lot_views = {lid: self._lot_view(lot) for lid, lot in self.lots.items()}
